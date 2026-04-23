@@ -6,8 +6,35 @@ import os
 DIRETORIO_ATUAL = os.path.dirname(os.path.abspath(__file__))
 CAMINHO_CSV = os.path.join(DIRETORIO_ATUAL, "log_contexto.csv")
 
-# Lista para guardar os eventos antes de passar para CSV
 eventos = []
+
+# ---------------------------------------------------------
+# PASSO 1: A LÓGICA DE PRIVACIDADE E CATEGORIZAÇÃO
+# ---------------------------------------------------------
+def categorizar_tecla(key):
+    """
+    Transforma a tecla premida numa categoria ética. 
+    Garante o Privacy-by-Design: nunca sabemos o que foi escrito, apenas a família da tecla.
+    """
+    try:
+        # Tentar ver se é um caractere normal (letras, números, símbolos)
+        char = key.char.lower()
+        if char in ['w', 'a', 's', 'd']:
+            return "Key_WASD"
+        else:
+            return "Key_AlphaNumeric"
+    except AttributeError:
+        # Se der erro, é porque é uma tecla especial (Shift, Espaço, Setas...)
+        if key == keyboard.Key.space:
+            return "Key_Space"
+        elif key in [keyboard.Key.backspace, keyboard.Key.delete]:
+            return "Key_Delete"
+        elif key in [keyboard.Key.up, keyboard.Key.down, keyboard.Key.left, keyboard.Key.right]:
+            return "Key_Arrow"
+        elif key == keyboard.Key.enter:
+            return "Key_Enter"
+        else:
+            return "Key_Modifier" 
 
 def registar_evento(tipo, detalhe):
     timestamp = time.time()
@@ -16,8 +43,6 @@ def registar_evento(tipo, detalhe):
 
 # --- CALLBACKS DO RATO ---
 def on_move(x, y):
-    # Para não encher o CSV, podes registar o movimento apenas a cada X milissegundos
-    # ou usar esta função para calcular a distância percorrida depois.
     pass 
 
 def on_click(x, y, button, pressed):
@@ -26,13 +51,16 @@ def on_click(x, y, button, pressed):
 
 # --- CALLBACKS DO TECLADO ---
 def on_press(key):
-    # Gravamos apenas que UMA tecla foi primida (Privacy-by-Design: não interessa qual)
-    registar_evento("Teclado", "Key_Press")
+    categoria = categorizar_tecla(key)
+    registar_evento("Teclado", f"{categoria}_Press")
 
 def on_release(key):
-    registar_evento("Teclado", "Key_Release")
+    categoria = categorizar_tecla(key)
+    registar_evento("Teclado", f"{categoria}_Release")
+    
     if key == keyboard.Key.esc:
         # Pressionar ESC para parar a gravação e guardar no CSV
+        print("\nA parar a monitorização...")
         guardar_dados()
         return False
 
@@ -42,9 +70,10 @@ def guardar_dados():
         writer = csv.writer(file)
         writer.writerow(["Timestamp", "Sensor", "Acao"])
         writer.writerows(eventos)
-    print("Dados guardados com sucesso em 'log_contexto.csv'!")
+    print(f"Dados guardados com sucesso em:\n{CAMINHO_CSV}")
 
 # --- INICIAR OS LISTENERS ---
+print("🛡️ MindGuard AI - Sensorização Ética Iniciada.")
 print("A gravar interações... Pressiona ESC para parar.")
 listener_rato = mouse.Listener(on_click=on_click, on_move=on_move)
 listener_teclado = keyboard.Listener(on_press=on_press, on_release=on_release)

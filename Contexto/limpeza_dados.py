@@ -1,34 +1,113 @@
-import pandas as pd
+import time
+import csv
+import math
 import os 
+from pynput import mouse, keyboard
+from datetime import datetime
 
 DIRETORIO_ATUAL = os.path.dirname(os.path.abspath(__file__))
 CAMINHO_CSV = os.path.join(DIRETORIO_ATUAL, "log_contexto.csv")
-CAMINHO_CSV_LIMPO = os.path.join(DIRETORIO_ATUAL, "dataset_contexto_limpo.csv")
 
-# 1. Carregar os dados brutos gerados no Passo 1
-# Assume-se que o ficheiro se chama 'log_contexto.csv'
-df = pd.read_csv(CAMINHO_CSV)
+# Variáveis globais
+eventos = []
+ultima_pos_rato = None  # Guarda a coordenada (x, y) da última interação
 
-# 2. Converter o Timestamp (segundos) para um formato de data/hora real
-df['Datetime'] = pd.to_datetime(df['Timestamp'], unit='s')
+# ---------------------------------------------------------
+# PASSO 1: LÓGICA DE PRIVACIDADE E CATEGORIZAÇÃO
+# ---------------------------------------------------------
+def categorizar_tecla(key):
+    """
+    Garante o Privacy-by-Design: nunca sabemos o que foi escrito, apenas a família da tecla.
+    """
+    try:
+        char = key.char.lower()
+        if char in ['w', 'a', 's', 'd']:
+            return "Key_WASD"
+        else:
+            return "Key_AlphaNumeric"
+    except AttributeError:
+        if key == keyboard.Key.space:
+            return "Key_Space"
+        elif key in [keyboard.Key.backspace, keyboard.Key.delete]:
+            return "Key_Delete"
+        elif key in [keyboard.Key.up, keyboard.Key.down, keyboard.Key.left, keyboard.Key.right]:
+            return "Key_Arrow"
+        elif key == keyboard.Key.enter:
+            return "Key_Enter"
+        else:
+            return "Key_Modifier"
 
-# 3. Definir a data/hora como o índice (necessário para agrupar por tempo)
-df.set_index('Datetime', inplace=True)
+def calcular_distancia(pos_atual):
+    """
+    Calcula os pixels percorridos desde a última ação (Teorema de Pitágoras).
+    """
+    global ultima_pos_rato
+    if ultima_pos_rato is None:
+        ultima_pos_rato = pos_atual
+        return 0
+    
+    dist = math.sqrt((pos_atual[0] - ultima_pos_rato[0])**2 + 
+                     (pos_atual[1] - ultima_pos_rato[1])**2)
+    
+    ultima_pos_rato = pos_atual
+    return dist
 
-# 4. Criar colunas para identificar os eventos específicos que nos interessam
-df['Teclas_Pressionadas'] = df['Acao'].apply(lambda x: 1 if 'Key_Press' in str(x) else 0)
-df['Cliques_Esquerdos'] = df['Acao'].apply(lambda x: 1 if 'Click_Press_left' in str(x) else 0)
-df['Cliques_Direitos'] = df['Acao'].apply(lambda x: 1 if 'Click_Press_right' in str(x) else 0)
+def registar_evento(tipo, detalhe, distancia=0):
+    """
+    Regista o evento com Tempo Legível, Timestamp Unix, Sensor, Ação e Distância.
+    """
+    timestamp_unix = time.time()
+    tempo_legivel = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    
+    dist_arredondada = round(distancia)
+    eventos.append([tempo_legivel, timestamp_unix, tipo, detalhe, dist_arredondada])
+    print(f"{tempo_legivel} | {tipo} | {detalhe} | Dist: {dist_arredondada}px")
 
-# 5. O SEGREDO: Agrupar tudo em janelas de 10 segundos ('10s') e somar!
-janelas = df.resample('10s').sum(numeric_only=True)
+# --- CALLBACKS DO RATO ---
+def on_move(x, y):
+    pass 
 
-# Limpar colunas desnecessárias (como a soma dos timestamps que não faz sentido)
-janelas = janelas.drop(columns=['Timestamp'])
+def on_click(x, y, button, pressed):
+    if pressed:
+        dist = calcular_distancia((x, y))
+        acao = f"Click_Press_{button.name}"
+        registar_evento("Rato", acao, dist)
 
-# 6. Mostrar o resultado (as "Features" para o nosso modelo de IA)
-print("--- DADOS PRONTOS PARA A INTELIGÊNCIA ARTIFICIAL ---")
-print(janelas.head())
+# --- CALLBACKS DO TECLADO ---
+def on_press(key):
+    # Captar onde o rato está parado enquanto se escreve
+    pos_atual_rato = mouse.Controller().position
+    dist = calcular_distancia(pos_atual_rato)
+    
+    categoria = categorizar_tecla(key)
+    registar_evento("Teclado", f"{categoria}_Press", dist)
 
-# Guardar o dataset final limpo
-janelas.to_csv(CAMINHO_CSV_LIMPO)
+def on_release(key):
+    # Não calculamos distância no release para não duplicar dados desnecessários
+    categoria = categorizar_tecla(key)
+    registar_evento("Teclado", f"{categoria}_Release", 0)
+    
+    if key == keyboard.Key.esc:
+        print("\n[!] A parar a monitorização...")
+        guardar_dados()
+        return False
+
+# --- GUARDAR DADOS ---
+def guardar_dados():
+    with open(CAMINHO_CSV, 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Datetime", "Timestamp", "Sensor", "Acao", "Distancia_Pixels"])
+        writer.writerows(eventos)
+    print(f"✅ Dados guardados com sucesso em:\n{CAMINHO_CSV}")
+
+# --- INICIAR OS LISTENERS ---
+print("🛡️ MindGuard AI - Sensorização Ética e Espacial Iniciada.")
+print("A gravar interações... Pressiona ESC para parar e guardar o ficheiro.")
+
+listener_rato = mouse.Listener(on_click=on_click)
+listener_teclado = keyboard.Listener(on_press=on_press, on_release=on_release)
+
+listener_rato.start()
+listener_teclado.start()
+listener_rato.join()
+listener_teclado.join()
