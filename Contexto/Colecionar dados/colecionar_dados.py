@@ -6,6 +6,8 @@ import torch
 import pickle
 from pynput import mouse, keyboard
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import firebase_admin
+from firebase_admin import credentials, firestore
 
 
 # ---------------------------------------------------------
@@ -18,6 +20,18 @@ CONTEXTO_CSV = os.path.join(DIRETORIO_ATUAL, "contexto.csv")
 # Caminhos para o modelo que treinaste no Colab
 MODELO_PATH = os.path.join(DIRETORIO_ATUAL, "modelo_contexto.pt")
 MAPPING_PATH = os.path.join(DIRETORIO_ATUAL, "label_mapping_contexto.pkl")
+
+
+# Iniciar ligação ao Firebase
+try:
+    cred = credentials.Certificate(os.path.join(DIRETORIO_ATUAL, "digital-fatigue-detector-firebase-adminsdk-fbsvc-e639133943.json"))
+    firebase_admin.initialize_app(cred)
+    db = firestore.client()
+    FIREBASE_ATIVO = True
+    print("Ligação ao Firebase Firestore estabelecida com sucesso!")
+except Exception as e:
+    print(f"Aviso: Não foi possível ligar ao Firebase. Erro: {e}")
+    FIREBASE_ATIVO = False
 
 # ---------------------------------------------------------
 # 2. CARREGAR Modelo
@@ -43,6 +57,7 @@ reverse_mapping = {v: k for k, v in label_mapping.items()}
 # 3. VARIÁVEIS GLOBAIS E FICHEIROS CSV
 # ---------------------------------------------------------
 eventos_minuto_atual = []
+buffer_firestore = []
 executando = True # Flag para sabermos quando o utilizador carregou no ESC
 
 # Criar cabeçalhos nos CSVs se os ficheiros ainda não existirem
@@ -54,8 +69,84 @@ if not os.path.exists(CONTEXTO_CSV):
     with open(CONTEXTO_CSV, 'w', newline='') as f:
         csv.writer(f).writerow(["Datetime", "Contexto_Previsto", "Confianca"])
 
+
+
 # ---------------------------------------------------------
-# 4. A LÓGICA DE SENSORES (Privacy-by-Design)
+# 4. FUNÇÃO DE AGREGAÇÃO E UPLOAD (Com Limpeza Automática)
+# ---------------------------------------------------------
+def agrupar_e_enviar_firestore():
+    global buffer_firestore
+    if not buffer_firestore or not FIREBASE_ATIVO:
+        return
+
+    blocos_agrupados = []
+    bloco_atual = None
+
+    # Lógica de agrupamento (Sessionização)
+    for prev in buffer_firestore:
+        if bloco_atual is None:
+            bloco_atual = {
+                "Data_Inicio": prev["tempo"],
+                "Data_Fim": prev["tempo"],
+                "Contexto": prev["contexto"],
+                "Confiancas": [prev["confianca"]]
+            }
+        elif prev["contexto"] == bloco_atual["Contexto"]:
+            # Se for o mesmo contexto contínuo, atualizamos a Data de Fim
+            bloco_atual["Data_Fim"] = prev["tempo"]
+            bloco_atual["Confiancas"].append(prev["confianca"])
+        else:
+            # Contexto mudou! Guardamos o bloco anterior
+            blocos_agrupados.append(bloco_atual)
+            bloco_atual = {
+                "Data_Inicio": prev["tempo"],
+                "Data_Fim": prev["tempo"],
+                "Contexto": prev["contexto"],
+                "Confiancas": [prev["confianca"]]
+            }
+    
+    # Adicionar o último bloco pendente
+    if bloco_atual:
+        blocos_agrupados.append(bloco_atual)
+
+    print(f"\n📦 A iniciar upload para Firestore... ({len(blocos_agrupados)} sessões)")
+    
+    # --- REDE DE SEGURANÇA: Só apaga se o envio for bem sucedido ---
+    try:
+        for bloco in blocos_agrupados:
+            media_acc = sum(bloco["Confiancas"]) / len(bloco["Confiancas"])
+            
+            doc_data = {
+                "Data_Inicio": bloco["Data_Inicio"],
+                "Data_Fim": bloco["Data_Fim"],
+                "Contexto": bloco["Contexto"],
+                "Accuracy": round(media_acc, 4)
+            }
+            
+            # Enviar para a coleção "sessoes_contexto"
+            db.collection("sessoes_contexto").add(doc_data)
+        
+        print("✅ Upload concluído com sucesso!")
+        
+        # --- LIMPEZA DOS DADOS LOCAIS ---
+        # 1. Limpar a memória do Python
+        buffer_firestore.clear() 
+        
+        # 2. Substituir os CSVs apenas pelos cabeçalhos limpos
+        with open(LOG_CSV, 'w', newline='') as f:
+            csv.writer(f).writerow(["Datetime", "Acoes_Agrupadas"])
+
+        with open(CONTEXTO_CSV, 'w', newline='') as f:
+            csv.writer(f).writerow(["Datetime", "Contexto_Previsto", "Confianca"])
+            
+        print("🗑️ Ficheiros CSV locais limpos (Armazenamento Efémero ativado).")
+
+    except Exception as e:
+        # Se a internet falhar, ele avisa e NÃO apaga nada. Tenta outra vez passados 10 min.
+        print(f"❌ Erro ao enviar para o Firestore: {e}")
+        print("⚠️ Os dados NÃO foram apagados localmente. Nova tentativa no próximo ciclo.")
+# ---------------------------------------------------------
+# 5. A LÓGICA DE SENSORES (Privacy-by-Design)
 # ---------------------------------------------------------
 def categorizar_tecla(key):
     try:
@@ -92,7 +183,7 @@ def on_release(key):
         return False
 
 # ---------------------------------------------------------
-# 5. O MOTOR DE INFERÊNCIA (Corre de 60 em 60 segundos)
+# 6. O MOTOR DE INFERÊNCIA (Corre de 60 em 60 segundos)
 # ---------------------------------------------------------
 def motor_de_analise():
     while executando:
@@ -111,6 +202,10 @@ def motor_de_analise():
 
         if len(dados_janela) < 5:
             print(f"[{agora}] 💤 Janela ignorada (Inatividade / Poucas ações).")
+            minutos_decorridos += 1 
+            if minutos_decorridos >= 10:
+                agrupar_e_enviar_firestore()
+                minutos_decorridos = 0
             continue
 
         # 2. Agrupar numa "frase"
@@ -138,6 +233,25 @@ def motor_de_analise():
         print(f"\n[{agora}] Previsão da IA: {contexto_previsto.upper()} (Confiança: {confianca*100:.1f}%)")
         with open(CONTEXTO_CSV, 'a', newline='') as f:
             csv.writer(f).writerow([agora, contexto_previsto, round(confianca, 4)])
+
+        # Adicionar à lista de espera do Firestore
+        buffer_firestore.append({
+            "tempo": agora,
+            "contexto": contexto_previsto,
+            "confianca": confianca
+        })
+
+        minutos_decorridos += 1
+        
+        # Dispara o upload de 10 em 10 minutos
+        if minutos_decorridos >= 10:
+            agrupar_e_enviar_firestore()
+            minutos_decorridos = 0
+
+    # Quando o ciclo quebra (ESC pressionado), envia o resto dos dados pendentes!
+    if buffer_firestore:
+        print("\n🛑 A fechar programa. A guardar dados pendentes na nuvem...")
+        agrupar_e_enviar_firestore()
 
 # ---------------------------------------------------------
 # 6. INICIAR O SISTEMA
