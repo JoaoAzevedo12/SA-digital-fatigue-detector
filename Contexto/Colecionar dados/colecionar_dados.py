@@ -186,75 +186,75 @@ def on_release(key):
 # 6. O MOTOR DE INFERÊNCIA (Corre de 60 em 60 segundos)
 # ---------------------------------------------------------
 def motor_de_analise():
+    global executando # Avisar o Python que vamos ler esta variável global
+    minutos_decorridos = 0 # Inicialização local clara
+    
     while executando:
-        # Espera 60 segundos, mas acorda a cada 1 segundo para verificar se carregaste no ESC
+        # Espera 60 segundos (1 min), verificando o ESC a cada segundo
         for _ in range(60):
-            if not executando: break
+            if not executando: 
+                break
             time.sleep(1)
             
-        if not executando: break
+        if not executando: 
+            break
 
-        # 1. Copiar os dados e limpar o balde para o próximo minuto não perder cliques
+        # 1. Copiar dados e limpar balde
         dados_janela = eventos_minuto_atual.copy()
         eventos_minuto_atual.clear()
         
         agora = time.strftime("%Y-%m-%d %H:%M:%S")
 
+        # 2. Verificar se houve atividade
         if len(dados_janela) < 5:
-            print(f"[{agora}] 💤 Janela ignorada (Inatividade / Poucas ações).")
-            minutos_decorridos += 1 
-            if minutos_decorridos >= 10:
-                agrupar_e_enviar_firestore()
-                minutos_decorridos = 0
-            continue
+            print(f"[{agora}] 💤 Janela ignorada (Inatividade).")
+            minutos_decorridos += 1 # Incremento mesmo em inatividade para o upload de 10min
+        else:
+            frase_acoes = " ".join(dados_janela)
 
-        # 2. Agrupar numa "frase"
-        frase_acoes = " ".join(dados_janela)
+            # Guardar no log local
+            with open(LOG_CSV, 'a', newline='') as f:
+                csv.writer(f).writerow([agora, frase_acoes])
 
-        # 3. Guardar no log_contexto.csv
-        with open(LOG_CSV, 'a', newline='') as f:
-            csv.writer(f).writerow([agora, frase_acoes])
+            # 3. Inferência (IA)
+            inputs = tokenizer(frase_acoes, return_tensors="pt", truncation=True, padding='max_length', max_length=512)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        # 4. Inferência (Perguntar à IA)
-        inputs = tokenizer(frase_acoes, return_tensors="pt", truncation=True, padding='max_length', max_length=512)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = model(**inputs)
+                probabilidades = torch.nn.functional.softmax(outputs.logits, dim=1)[0]
+                pred_id = torch.argmax(probabilidades).item()
+                confianca = probabilidades[pred_id].item()
 
-        with torch.no_grad():
-            outputs = model(**inputs)
-            logits = outputs.logits
-            # Converter matemática em previsões (Softmax)
-            probabilidades = torch.nn.functional.softmax(logits, dim=1)[0]
-            pred_id = torch.argmax(probabilidades).item()
-            confianca = probabilidades[pred_id].item()
+            contexto_previsto = reverse_mapping[pred_id]
+            
+            print(f"\n[{agora}] 🎯 Previsão: {contexto_previsto.upper()} (Confiança: {confianca*100:.1f}%)")
+            
+            with open(CONTEXTO_CSV, 'a', newline='') as f:
+                csv.writer(f).writerow([agora, contexto_previsto, round(confianca, 4)])
 
-        contexto_previsto = reverse_mapping[pred_id]
+            # Guardar para o Firestore
+            buffer_firestore.append({
+                "tempo": agora,
+                "contexto": contexto_previsto,
+                "confianca": confianca
+            })
+
+            minutos_decorridos += 1
         
-        # 5. Imprimir no ecrã e guardar no contexto.csv
-        print(f"\n[{agora}] Previsão da IA: {contexto_previsto.upper()} (Confiança: {confianca*100:.1f}%)")
-        with open(CONTEXTO_CSV, 'a', newline='') as f:
-            csv.writer(f).writerow([agora, contexto_previsto, round(confianca, 4)])
-
-        # Adicionar à lista de espera do Firestore
-        buffer_firestore.append({
-            "tempo": agora,
-            "contexto": contexto_previsto,
-            "confianca": confianca
-        })
-
-        minutos_decorridos += 1
-        
-        # Dispara o upload de 10 em 10 minutos
+        # 4. Verificar se é altura do Upload (10 minutos)
         if minutos_decorridos >= 10:
+            print(f"\n⏰ Passaram {minutos_decorridos} minutos. A preparar upload...")
             agrupar_e_enviar_firestore()
-            minutos_decorridos = 0
+            minutos_decorridos = 0 # Reset do contador
 
-    # Quando o ciclo quebra (ESC pressionado), envia o resto dos dados pendentes!
+    # Ao sair do loop (ESC), faz o último envio se houver dados
     if buffer_firestore:
-        print("\n🛑 A fechar programa. A guardar dados pendentes na nuvem...")
+        print("\n🛑 Programa interrompido. A enviar dados finais para a cloud...")
         agrupar_e_enviar_firestore()
 
 # ---------------------------------------------------------
-# 6. INICIAR O SISTEMA
+# 7. INICIAR O SISTEMA
 # ---------------------------------------------------------
 # Arranca o cronómetro de 60 segundos numa "Thread" paralela (em segundo plano)
 thread_ia = threading.Thread(target=motor_de_analise)
